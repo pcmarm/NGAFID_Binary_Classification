@@ -1,31 +1,43 @@
 
-import gdown
-import pandas as pd
-import numpy as np
-from sklearn import preprocessing
-from tqdm.autonotebook import tqdm
-import tensorflow as tf
-from loguru import logger
-from ngafiddataset.utils import shell_exec
 import os
 import tarfile
 import shutil
 import typing
+import hashlib
+import time
+
+import requests
+import gdown
+import pandas as pd
+import numpy as np
+from tqdm.autonotebook import tqdm
+import tensorflow as tf
+from loguru import logger
 from compress_pickle import load
 
+from ngafiddataset.utils import shell_exec
 from ngafiddataset.dataset.utils import *
-
 
 
 class NGAFID_Dataset_Downloader:
 
     ngafid_urls = {
-        "all_flights": "https://zenodo.org/records/6624956/files/all_flight.tar.gz?download=1",
-        "2days": "https://zenodo.org/records/6624956/files/2days.tar.gz?download=1",
+        "all_flights": "https://zenodo.org/records/6624956/files/all_flight.tar.gz",
+        "2days": "https://zenodo.org/records/6624956/files/2days.tar.gz",
+    }
+
+    ngafid_api_urls = {
+        "all_flights": "https://zenodo.org/api/records/6624956/files/all_flight.tar.gz/content",
+        "2days": "https://zenodo.org/api/records/6624956/files/2days.tar.gz/content",
+    }
+
+    ngafid_checksums = {
+        "all_flights": "8d7501a4ea02eb113172938abdc76cf1",
+        "2days": "83d70602c5cda57bba3512035c8abab0",
     }
 
     @classmethod
-    def download(cls, name: str, destination: str = '', extract: bool = True):
+    def download(cls, name: str, destination: str = '', extract: bool = True, max_retries: int = 3):
         """
         下载并解压数据集文件。
 
@@ -33,6 +45,7 @@ class NGAFID_Dataset_Downloader:
             name: 数据集名称 ('2days' 或 'all_flights')
             destination: 保存目录路径
             extract: 是否需要解压
+            max_retries: 下载失败时的最大重试次数
 
         Returns:
             (name, destination): 数据集名称和目标目录
@@ -40,6 +53,8 @@ class NGAFID_Dataset_Downloader:
         assert name in cls.ngafid_urls.keys()
 
         url = cls.ngafid_urls[name]
+        api_url = cls.ngafid_api_urls[name]
+        checksum = cls.ngafid_checksums[name]
         output = os.path.join(destination, "%s.tar.gz" % name)
         extract_dir = os.path.join(destination, name)
 
@@ -48,10 +63,30 @@ class NGAFID_Dataset_Downloader:
             logger.info(f'数据已解压，跳过解压步骤: {extract_dir}')
             return name, destination
 
-        # 下载文件（如果不存在）
+        # 删除损坏的或不完整的文件以便重新下载
+        if os.path.exists(output):
+            if not cls._verify_checksum(output, checksum):
+                logger.warning(f'文件校验失败，将重新下载: {output}')
+                os.remove(output)
+
+        # 下载文件
         if not os.path.exists(output):
-            logger.info(f'正在下载数据集: {name}')
-            gdown.download(url, output, quiet=False)
+            logger.info(f'正在下载数据集: {name} (来源: {url})')
+            success = cls._download_with_retry(api_url, output, name, max_retries)
+            if not success:
+                raise RuntimeError(
+                    f"下载数据集 '{name}' 失败，已达到最大重试次数 ({max_retries})。"
+                    f"请检查网络连接或手动下载文件: {url}"
+                )
+
+            # 校验文件完整性
+            if not cls._verify_checksum(output, checksum):
+                raise RuntimeError(
+                    f"文件校验失败！MD5 不匹配。\n"
+                    f"  文件: {output}\n"
+                    f"  预期: {checksum}\n"
+                    f"请删除该文件后重试，或手动下载: {url}"
+                )
         else:
             logger.info(f'压缩文件已存在: {output}')
 
@@ -62,6 +97,110 @@ class NGAFID_Dataset_Downloader:
             logger.info('解压完成')
 
         return name, destination
+
+    @classmethod
+    def _download_with_retry(cls, url: str, output: str, name: str, max_retries: int = 3) -> bool:
+        """
+        使用 requests 流式下载文件，支持断点续传和重试。
+
+        Args:
+            url: 下载 URL (Zenodo API content URL)
+            output: 保存路径
+            name: 数据集名称
+            max_retries: 最大重试次数
+
+        Returns:
+            bool: 下载是否成功
+        """
+        for attempt in range(1, max_retries + 1):
+            try:
+                logger.info(f'下载尝试 {attempt}/{max_retries}')
+                cls._download_file(url, output, name)
+                return True
+            except requests.exceptions.RequestException as e:
+                logger.warning(f'下载失败 (尝试 {attempt}/{max_retries}): {e}')
+                if attempt < max_retries:
+                    wait_time = 2 ** attempt  # 指数退避: 2s, 4s, 8s, ...
+                    logger.info(f'{wait_time} 秒后重试...')
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f'下载失败，已达到最大重试次数')
+                    return False
+        return False
+
+    @classmethod
+    def _download_file(cls, url: str, output: str, name: str):
+        """
+        使用 requests 流式下载文件，支持断点续传，显示进度条。
+        """
+        headers = {}
+        downloaded_size = 0
+
+        # 断点续传：检查已下载的大小
+        if os.path.exists(output):
+            downloaded_size = os.path.getsize(output)
+            headers['Range'] = f'bytes={downloaded_size}-'
+            logger.info(f'检测到已下载 {downloaded_size} 字节，继续下载...')
+
+        with requests.get(url, headers=headers, stream=True, timeout=300) as response:
+            response.raise_for_status()
+
+            # 获取文件总大小
+            total_size = int(response.headers.get('Content-Length', 0))
+            if total_size == 0:
+                total_size = int(response.headers.get('content-length', 0))
+
+            # 如果使用 Range 请求，服务器应返回 206 Partial Content
+            # 否则从头开始下载
+            if response.status_code == 206:
+                total_size += downloaded_size
+            else:
+                downloaded_size = 0
+                # 删除不完整的旧文件
+                if os.path.exists(output):
+                    os.remove(output)
+
+            desc = f'下载 {name}'
+            with open(output, 'ab' if downloaded_size > 0 else 'wb') as f, \
+                    tqdm(total=total_size, initial=downloaded_size, unit='B',
+                         unit_scale=True, unit_divisor=1024, desc=desc) as pbar:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        pbar.update(len(chunk))
+
+    @classmethod
+    def _verify_checksum(cls, filepath: str, expected_md5: str) -> bool:
+        """
+        验证文件的 MD5 校验和。
+
+        Args:
+            filepath: 文件路径
+            expected_md5: 预期的 MD5 校验和 (32位十六进制字符串)
+
+        Returns:
+            bool: 校验是否通过
+        """
+        if not os.path.exists(filepath):
+            return False
+
+        md5_hash = hashlib.md5()
+        with open(filepath, 'rb') as f:
+            # 流式读取，避免大文件占用过多内存
+            for chunk in iter(lambda: f.read(8192), b''):
+                md5_hash.update(chunk)
+
+        actual_md5 = md5_hash.hexdigest()
+        match = actual_md5 == expected_md5.lower()
+        if match:
+            logger.info(f'文件校验通过: {filepath}')
+        else:
+            logger.warning(
+                f'文件校验失败: {filepath}\n'
+                f'  预期: {expected_md5}\n'
+                f'  实际: {actual_md5}'
+            )
+        return match
 
     @classmethod
     def _is_extracted(cls, name: str, destination: str = '') -> bool:
