@@ -20,8 +20,8 @@ from ngafiddataset.dataset.utils import *
 class NGAFID_Dataset_Downloader:
 
     ngafid_urls = {
-        "all_flights": "https://drive.google.com/uc?id=1-0pVPhwRQoifT_VuQyGDLXuzYPYySX-Y",
-        "2days": "https://drive.google.com/uc?id=1-2pxwiQNhFnhTg7whosQoF_yztD5jOM2",
+        "all_flights": "https://zenodo.org/records/6624956/files/all_flight.tar.gz?download=1",
+        "2days": "https://zenodo.org/records/6624956/files/2days.tar.gz?download=1",
     }
 
     @classmethod
