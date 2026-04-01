@@ -483,4 +483,4 @@ Phase 3 (长期): 工程落地
 ---
 
 *文档生成日期: 2026-04-01*
-*项目地址: [NGAFIDDATASET-main](https://github.com/example/NGAFIDDATASET-main)*
+*项目地址: https://github.com/pcmarm/NGAFID_Binary_Classification
